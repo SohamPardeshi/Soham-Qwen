@@ -1,10 +1,11 @@
 import os
+import inspect
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import bitsandbytes as bnb
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from transformers import (
     AutoProcessor,
     BitsAndBytesConfig,
@@ -12,7 +13,12 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
-from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
+from torch.nn.utils.rnn import pad_sequence
+
+
+# -------------------------
+# Configuration
+# -------------------------
 
 HF_TOKEN = "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"
 
@@ -26,20 +32,25 @@ class TrainConfig:
     data_path: str = "data/output/dataset.jsonl"
     out_dir: str = "model/output/qwen3vl_soham_lora"
 
+    # Arrow Caching
+    tokenized_cache_dir: str = "data/cache/tokenized_qwen3vl"
+    rebuild_tokenized_cache: bool = False
+
     # Dataset
     seed: int = 42
     eval_split_ratio: float = 0.02
 
     # Training
+    batch_size: int = 512
     max_length: int = 2048
     packing: bool = False
     num_train_epochs: int = 1
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 8
     learning_rate: float = 1e-4
-    logging_steps: int = 10
-    save_steps: int = 200
-    eval_steps: int = 200
+    logging_steps: int = 50
+    save_steps: int = 10000
+    eval_steps: int = 10000
     save_total_limit: int = 2
     enable_gradient_checkpointing: bool = True
 
@@ -65,9 +76,12 @@ class TrainConfig:
     dry_run: bool = False
     max_debug_examples: int = 3
     print_raw_examples: bool = False
-    print_formatted_examples: bool = False
-    inspect_collator: bool = False
+    inspect_labels: bool = False  # prints assistant-only decoded label span
 
+
+# -------------------------
+# Environment / loading
+# -------------------------
 
 def _require_cuda() -> None:
     if not torch.cuda.is_available():
@@ -89,7 +103,7 @@ def _load_processor_and_tokenizer(model_id: str, token: Optional[str]):
     processor = AutoProcessor.from_pretrained(model_id, token=token)
     tokenizer = processor.tokenizer
 
-    # Ensure EOS token is set; Qwen chat templates often rely on <|im_end|>
+    # Ensure EOS token is set
     if tokenizer.eos_token is None:
         tokenizer.eos_token = "<|im_end|>"
         tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
@@ -100,7 +114,7 @@ def _load_processor_and_tokenizer(model_id: str, token: Optional[str]):
 
 
 def _build_quant_config(cfg: TrainConfig) -> BitsAndBytesConfig:
-    compute_dtype = torch.bfloat16 if cfg.bf16 and torch.cuda.is_bf16_supported() else torch.float16
+    compute_dtype = torch.bfloat16 if (cfg.bf16 and torch.cuda.is_bf16_supported()) else torch.float16
     return BitsAndBytesConfig(
         load_in_4bit=cfg.load_in_4bit,
         bnb_4bit_quant_type=cfg.bnb_4bit_quant_type,
@@ -145,13 +159,122 @@ def _attach_lora(cfg: TrainConfig, model):
     return model
 
 
-def _load_and_split_dataset(cfg: TrainConfig):
-    print("Loading dataset")
-    ds = load_dataset("json", data_files={"train": cfg.data_path}, split="train")
+# -------------------------
+# Dataset tokenization + labels (assistant-only)
+# -------------------------
 
-    split = ds.train_test_split(test_size=cfg.eval_split_ratio, seed=cfg.seed)
-    train_ds = split["train"]
-    eval_ds = split["test"]
+QWEN_IM_START = "<|im_start|>"
+QWEN_IM_END = "<|im_end|>\n"  # if your template has no trailing newline, change to "<|im_end|>"
+
+def _encode_piece(tokenizer, text: str) -> List[int]:
+    return tokenizer.encode(text, add_special_tokens=False)
+
+
+def _tokenize_conversation_assistant_only(
+    example: Dict[str, Any],
+    tokenizer,
+    max_length: int,
+) -> Dict[str, Any]:
+    """
+    Builds input_ids + labels directly from message roles.
+    Labels are -100 everywhere except assistant content tokens.
+    """
+    input_ids: List[int] = []
+    labels: List[int] = []
+
+    messages: List[Dict[str, Any]] = example["messages"]
+
+    for m in messages:
+        role = m["role"]
+        content = m.get("content", "")
+
+        # Wrapper tokens, matching Qwen template style
+        prefix_text = f"{QWEN_IM_START}{role}\n"
+        suffix_text = QWEN_IM_END
+
+        prefix_ids = _encode_piece(tokenizer, prefix_text)
+
+        if role == "assistant":
+            content = content.rstrip() + "\n"
+        content_ids = _encode_piece(tokenizer, content)
+        
+        suffix_ids = _encode_piece(tokenizer, suffix_text)
+
+        # Append to input_ids
+        input_ids.extend(prefix_ids)
+        input_ids.extend(content_ids)
+        input_ids.extend(suffix_ids)
+
+        # Append to labels
+        if role == "assistant":
+            # Mask wrapper tokens, unmask only the content tokens
+            labels.extend([-100] * len(prefix_ids))
+            labels.extend(content_ids)
+            labels.extend([-100] * len(suffix_ids))
+        else:
+            # Mask everything for system/user turns
+            labels.extend([-100] * (len(prefix_ids) + len(content_ids) + len(suffix_ids)))
+
+        # Truncate if needed (keep input_ids and labels aligned)
+        if len(input_ids) >= max_length:
+            input_ids = input_ids[:max_length]
+            labels = labels[:max_length]
+            break
+
+    attention_mask = [1] * len(input_ids)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+
+def _tokenize_conversation_assistant_only_batched(batch: Dict[str, Any], tokenizer, max_length: int) -> Dict[str, Any]:
+    input_ids_list = []
+    attention_mask_list = []
+    labels_list = []
+
+    for messages in batch["messages"]:
+        ex = {"messages": messages}
+        out = _tokenize_conversation_assistant_only(ex, tokenizer, max_length)
+        input_ids_list.append(out["input_ids"])
+        attention_mask_list.append(out["attention_mask"])
+        labels_list.append(out["labels"])
+
+    return {
+        "input_ids": input_ids_list,
+        "attention_mask": attention_mask_list,
+        "labels": labels_list,
+    }
+
+
+def _load_and_prepare_dataset(cfg: TrainConfig, tokenizer):
+    if (not cfg.rebuild_tokenized_cache) and os.path.isdir(cfg.tokenized_cache_dir):
+        print(f"Loading tokenized dataset from disk: {cfg.tokenized_cache_dir}")
+        ds = load_from_disk(cfg.tokenized_cache_dir)
+    else:
+        print("Loading raw JSONL dataset")
+        ds = load_dataset("json", data_files={"train": cfg.data_path}, split="train")
+
+        is_windows = (os.name == "nt")
+        num_proc = 1 if is_windows else max(1, os.cpu_count() - 1)
+
+        ds = ds.map(
+            lambda batch: _tokenize_conversation_assistant_only_batched(batch, tokenizer, cfg.max_length),
+            batched=True,
+            batch_size=cfg.batch_size,
+            num_proc=num_proc,
+            writer_batch_size=cfg.batch_size,
+            remove_columns=ds.column_names,
+            desc="Tokenizing + building assistant-only labels (batched)",
+        )
+
+        print(f"Saving tokenized dataset to disk: {cfg.tokenized_cache_dir}")
+        ds.save_to_disk(cfg.tokenized_cache_dir)
+
+    # OPTIMIZATION: for large dataset, we don't want to shuffle the entire thing in memory
+    eval_every = max(1, int(1 / cfg.eval_split_ratio))
+    eval_ds = ds.filter(lambda ex, idx: (idx % eval_every) == 0, with_indices=True)
+    train_ds = ds.filter(lambda ex, idx: (idx % eval_every) != 0, with_indices=True)
 
     print(f"  Train size: {len(train_ds)}")
     print(f"  Eval size:  {len(eval_ds)}")
@@ -159,45 +282,36 @@ def _load_and_split_dataset(cfg: TrainConfig):
     return train_ds, eval_ds
 
 
-def to_qwen3vl_message_segments(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Converts [{"role": "...", "content": "..."}] into Qwen3-VL multimodal segments:
-      [{"role": "...", "content": [{"type":"text","text":"..."}]}]
-    """
-    out = []
-    for m in messages:
-        out.append(
-            {
-                "role": m["role"],
-                "content": [{"type": "text", "text": m.get("content", "")}],
-            }
-        )
-    return out
+# -------------------------
+# Collator (pads input_ids/attention_mask/labels)
+# -------------------------
+
+class PadToMaxInBatch:
+    def __init__(self, tokenizer):
+        pad_token = tokenizer.pad_token or tokenizer.eos_token
+        self.pad_token_id = tokenizer.convert_tokens_to_ids(pad_token)
+
+    def __call__(self, features):
+        ids = [torch.tensor(f["input_ids"], dtype=torch.long) for f in features]
+        labs = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
+        ams = [torch.tensor(f.get("attention_mask", [1] * len(f["input_ids"])), dtype=torch.long) for f in features]
+
+        input_ids = pad_sequence(ids, batch_first=True, padding_value=self.pad_token_id)
+        labels = pad_sequence(labs, batch_first=True, padding_value=-100)
+        attention_mask = pad_sequence(ams, batch_first=True, padding_value=0)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
 
 
-def build_formatting_func(processor):
-    def formatting_func(example: Dict[str, Any]) -> str:
-        msgs = to_qwen3vl_message_segments(example["messages"])
-        return processor.apply_chat_template(
-            msgs,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    return formatting_func
+# -------------------------
+# Trainer
+# -------------------------
 
-
-def _build_collator(tokenizer):
-    pad_token = tokenizer.pad_token or tokenizer.eos_token
-    pad_token_id = tokenizer.convert_tokens_to_ids(pad_token)
-
-    return DataCollatorForLanguageModeling(
-        pad_token_id=pad_token_id,
-        completion_only_loss=True,
-        padding_free=False,
-    )
-
-
-def _build_trainer(cfg: TrainConfig, model, tokenizer, processor, train_ds, eval_ds):
+def _build_trainer(cfg: TrainConfig, model, tokenizer, train_ds, eval_ds):
     print("Building trainer")
     args = SFTConfig(
         output_dir=cfg.out_dir,
@@ -217,127 +331,101 @@ def _build_trainer(cfg: TrainConfig, model, tokenizer, processor, train_ds, eval
         report_to=[],
     )
 
-    formatting_func = build_formatting_func(processor)
-    collator = _build_collator(tokenizer)
+    collator = PadToMaxInBatch(tokenizer)
+
+    # Newer TRL versions support skipping dataset preparation when you pass pre-tokenized datasets.
+    init_sig = inspect.signature(SFTTrainer.__init__)
+    extra_kwargs = {}
+    if "dataset_kwargs" in init_sig.parameters:
+        extra_kwargs["dataset_kwargs"] = {"skip_prepare_dataset": True}
 
     trainer = SFTTrainer(
         model=model,
         args=args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        processing_class=tokenizer, # ALTERNATIVELY: try processor
-        formatting_func=formatting_func,
+        processing_class=tokenizer,
         data_collator=collator,
+        **extra_kwargs,
     )
 
     print("")
-    return trainer, formatting_func, collator
+    return trainer
 
 
-def _debug_print_examples(cfg: TrainConfig, train_ds, formatting_func) -> None:
+# -------------------------
+# Debug
+# -------------------------
+
+def decode_unmasked_spans(tokenizer, input_ids, labels):
+    spans = []
+    start = None
+    for i, lab in enumerate(labels):
+        if lab != -100 and start is None:
+            start = i
+        if lab == -100 and start is not None:
+            spans.append((start, i))
+            start = None
+    if start is not None:
+        spans.append((start, len(labels)))
+
+    texts = []
+    for (a, b) in spans:
+        texts.append(tokenizer.decode(input_ids[a:b], skip_special_tokens=False))
+    return texts
+
+def _debug_print_examples(cfg: TrainConfig, train_ds, tokenizer) -> None:
     n = min(cfg.max_debug_examples, len(train_ds))
 
     if cfg.print_raw_examples:
-        print("Raw training examples")
+        print("Raw training examples (tokenized dict keys)")
         for i in range(n):
             ex = train_ds[i]
             print(f"\n--- example {i} ---")
-            print(ex)
+            print({k: (len(v) if isinstance(v, list) else v) for k, v in ex.items()})
 
-    if cfg.print_formatted_examples:
-        print("\nFormatted training examples (chat template output)")
+    if cfg.inspect_labels:
+        print("\nAssistant-only label inspection")
         for i in range(n):
             ex = train_ds[i]
-            text = formatting_func(ex)
-            print(f"\n--- formatted {i} ---")
-            print(text)
+            ids = ex["input_ids"]
+            labs = ex["labels"]
+
+            first_unmasked = next((j for j, x in enumerate(labs) if x != -100), None)
+            masked = sum(1 for x in labs if x == -100)
+            unmasked = len(labs) - masked
+
+            print(f"\n--- example {i} ---")
+            print(f"  seq_len: {len(ids)}")
+            print(f"  masked: {masked}")
+            print(f"  unmasked: {unmasked}")
+            print(f"  first unmasked label index: {first_unmasked}")
+
+            # Decode only assistant-supervised tokens
+            # unmasked_ids = [tid for tid, lab in zip(ids, labs) if lab != -100]
+            # print("\n  decoded UNMASKED span (should be assistant-only content):")
+            # print(tokenizer.decode(unmasked_ids, skip_special_tokens=False))
+
+            span_texts = decode_unmasked_spans(tokenizer, ex["input_ids"], ex["labels"])
+            print("\n  decoded UNMASKED spans (per assistant chunk):")
+            for j, t in enumerate(span_texts):
+                print(f"    [span {j}] {repr(t)}")
+
+            # Optional: show first ~200 tokens of the full sequence for context
+            preview_n = min(200, len(ids))
+            print("\n  decoded preview (start of full sequence):")
+            print(tokenizer.decode(ids[:preview_n], skip_special_tokens=False))
+
+        decoded_full = tokenizer.decode(ex["input_ids"], skip_special_tokens=False)
+        decoded_unmasked = tokenizer.decode([tid for tid, lab in zip(ex["input_ids"], ex["labels"]) if lab != -100], skip_special_tokens=False)
 
 
-def _debug_inspect_collator(
-    cfg: TrainConfig,
-    train_ds,
-    formatting_func,
-    collator,
-    tokenizer,
-) -> None:
-    if not cfg.inspect_collator:
-        return
 
-    n = min(cfg.max_debug_examples, len(train_ds))
-    print("\nCollator inspection (input_ids / labels masking)")
-
-    # 1) Format to chat-templated text
-    texts = [formatting_func(train_ds[i]) for i in range(n)]
-
-    # 2) Tokenize to produce input_ids / attention_mask
-    # Use padding=False here; the collator will pad.
-    tokenized = tokenizer(
-        texts,
-        truncation=True,
-        max_length=cfg.max_length,
-        padding=False,
-        return_attention_mask=True,
-        add_special_tokens=False,  # important: chat template already includes special tokens
-    )
-
-    # 3) Build features list the way TRL collator expects
-    examples = []
-    for i in range(n):
-        examples.append(
-            {
-                "input_ids": tokenized["input_ids"][i],
-                "attention_mask": tokenized["attention_mask"][i],
-            }
-        )
-
-    # 4) Collate (this will create labels and apply completion-only masking)
-    out = collator(examples)
-
-    input_ids = out["input_ids"]
-    labels = out["labels"]
-
-    for i in range(n):
-        ids = input_ids[i].tolist()
-        labs = labels[i].tolist()
-
-        masked = sum(1 for x in labs if x == -100)
-        unmasked = len(labs) - masked
-
-        print(f"\n--- batch item {i} ---")
-        print(f"  seq_len:  {len(ids)}")
-        print(f"  masked:   {masked}")
-        print(f"  unmasked: {unmasked}")
-
-        preview_n = min(180, len(ids))
-        decoded_preview = tokenizer.decode(ids[:preview_n], skip_special_tokens=False)
-        print("\n  decoded preview (start of sequence):")
-        print(decoded_preview)
-
-        first_unmasked = next((j for j, x in enumerate(labs) if x != -100), None)
-        print(f"\n  first unmasked label index: {first_unmasked}")
-
-        if first_unmasked is not None:
-            # show a small window around where loss starts
-            start = max(0, first_unmasked - 40)
-            end = min(len(ids), first_unmasked + 140)
-            window_ids = ids[start:end]
-            window_labs = labs[start:end]
-
-            window_text = tokenizer.decode(window_ids, skip_special_tokens=False)
-            print("\n  decoded window around first unmasked token:")
-            print(window_text)
-
-            # show how many tokens in this window are masked/unmasked
-            w_masked = sum(1 for x in window_labs if x == -100)
-            w_unmasked = len(window_labs) - w_masked
-            print(f"\n  window masked: {w_masked}, window unmasked: {w_unmasked}")
-
+# -------------------------
+# Entry point
+# -------------------------
 
 def run_training(cfg: TrainConfig) -> None:
-    """
-    End-to-end finetuning entrypoint (callable from elsewhere).
-    Set cfg.dry_run=True to verify everything and print debug output without training.
-    """
     _require_cuda()
     token = _get_hf_token(cfg)
 
@@ -345,23 +433,18 @@ def run_training(cfg: TrainConfig) -> None:
     model = _load_base_model(cfg, token)
     model = _attach_lora(cfg, model)
 
-    train_ds, eval_ds = _load_and_split_dataset(cfg)
+    train_ds, eval_ds = _load_and_prepare_dataset(cfg, tokenizer)
 
-    trainer, formatting_func, collator = _build_trainer(
-        cfg=cfg,
-        model=model,
-        tokenizer=tokenizer,
-        processor=processor,
-        train_ds=train_ds,
-        eval_ds=eval_ds,
-    )
-
-    _debug_print_examples(cfg, train_ds, formatting_func)
-    _debug_inspect_collator(cfg, train_ds, formatting_func, collator, tokenizer)
+    _debug_print_examples(cfg, train_ds, tokenizer)
 
     if cfg.dry_run:
         print("\nDry run enabled. Exiting before training.")
         return
+
+    trainer = _build_trainer(cfg, model, tokenizer, train_ds, eval_ds)
+
+    print("Training prechecks:")
+    print("Trainer collator:", type(trainer.data_collator))
 
     print("Starting training")
     trainer.train()
@@ -369,5 +452,4 @@ def run_training(cfg: TrainConfig) -> None:
     print("Saving adapter and processor")
     trainer.save_model(cfg.out_dir)
     processor.save_pretrained(cfg.out_dir)
-
     print(f"Done. Saved to: {cfg.out_dir}")
