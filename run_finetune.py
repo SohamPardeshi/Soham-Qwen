@@ -1,4 +1,3 @@
-import os
 from finetune import TrainConfig, run_training
 from multiprocessing import freeze_support
 

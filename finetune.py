@@ -1,4 +1,6 @@
 import os
+from dotenv import load_dotenv
+
 import inspect
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,14 +17,18 @@ from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
 from torch.nn.utils.rnn import pad_sequence
 
+# -------------------------
+# Environment inits
+# -------------------------
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+load_dotenv()
 
 # -------------------------
 # Configuration
 # -------------------------
-
-HF_TOKEN = "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"
 
 @dataclass
 class TrainConfig:
@@ -97,7 +103,10 @@ def _require_cuda() -> None:
 
 
 def _get_hf_token(cfg: TrainConfig) -> Optional[str]:
-    return HF_TOKEN
+    token = os.environ.get("HF_TOKEN")
+    if token is None:
+        raise EnvironmentError("HuggingFace token not found in HF_TOKEN environment variable.")
+    return token
 
 
 def _load_processor_and_tokenizer(model_id: str, token: Optional[str]):
