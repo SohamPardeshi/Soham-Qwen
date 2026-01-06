@@ -1,4 +1,5 @@
-# Soham Finetune
+# Soham-Qwen
+A toy project to finetune Qwen3-VL-8B-Instruct on my Facebook Messenger chat history.
 
 ## Initialize Virtual Environment
 
@@ -30,4 +31,5 @@ qwen3-env\Scripts\activate.bat
 Run `python run_finetune.py` to go through the training process.
 
 ## Interact with the Model
+
 Run `python run_model.py` to prompt the model.
