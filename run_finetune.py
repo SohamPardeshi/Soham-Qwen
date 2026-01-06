@@ -6,6 +6,7 @@ def main():
     cfg = TrainConfig(
         data_path="data/output/dataset.jsonl",
         out_dir="model/output/qwen3vl_soham_lora",
+        # rebuild_tokenized_cache = True, # Only if the dataset.jsonl has changed
         batch_size=512,
         dry_run=False,
         max_debug_examples=5,

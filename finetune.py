@@ -15,6 +15,8 @@ from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
 from torch.nn.utils.rnn import pad_sequence
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # -------------------------
 # Configuration
@@ -45,14 +47,14 @@ class TrainConfig:
     max_length: int = 2048
     packing: bool = False
     num_train_epochs: int = 1
-    per_device_train_batch_size: int = 1
-    gradient_accumulation_steps: int = 8
+    per_device_train_batch_size: int = 2
+    gradient_accumulation_steps: int = 4
     learning_rate: float = 1e-4
-    logging_steps: int = 50
-    save_steps: int = 10000
-    eval_steps: int = 10000
+    logging_steps: int = 10
+    save_steps: int = 200
+    eval_steps: int = 200
     save_total_limit: int = 2
-    enable_gradient_checkpointing: bool = True
+    enable_gradient_checkpointing: bool = False
 
     # Precision
     bf16: bool = True
@@ -249,7 +251,7 @@ def _tokenize_conversation_assistant_only_batched(batch: Dict[str, Any], tokeniz
 
 def _load_and_prepare_dataset(cfg: TrainConfig, tokenizer):
     if (not cfg.rebuild_tokenized_cache) and os.path.isdir(cfg.tokenized_cache_dir):
-        print(f"Loading tokenized dataset from disk: {cfg.tokenized_cache_dir}")
+        print(f"Loading cached tokenized dataset from disk: {cfg.tokenized_cache_dir}")
         ds = load_from_disk(cfg.tokenized_cache_dir)
     else:
         print("Loading raw JSONL dataset")

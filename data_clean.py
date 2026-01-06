@@ -1,17 +1,19 @@
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-URL_RE = re.compile(r'https?://\S+')
-MESSAGE_FILE_RE = re.compile(r"^message_(\d+)\.json$", re.IGNORECASE)
+URL_RE = re.compile(r"https?://\S+")
+# Matches message_<thread>_<idx>.json created by your new copy/rename step
+NEW_MESSAGE_FILE_RE = re.compile(r"^message_(.+)_(\d+)\.json$", re.IGNORECASE)
+
 
 def has_any_key(d: Dict[str, Any], keys: List[str]) -> bool:
     return any(k in d for k in keys)
 
+
 def looks_like_call_or_system_text(text: str) -> bool:
     t = text.lower().strip()
-    # Extend as you find more patterns in your exports
     if t.startswith("you called "):
         return True
     if t.endswith(" called you."):
@@ -22,6 +24,7 @@ def looks_like_call_or_system_text(text: str) -> bool:
         return True
     return False
 
+
 def normalize_message(
     msg: Dict[str, Any],
     skip_if_has_keys: List[str],
@@ -29,7 +32,7 @@ def normalize_message(
 ) -> Optional[Dict[str, Any]]:
     """
     Returns a normalized message event:
-      { sender_name, ts_ms, text }
+      { sender, ts_ms, text }
     or None if message should be skipped.
     """
     if has_any_key(msg, skip_if_has_keys):
@@ -45,25 +48,25 @@ def normalize_message(
     if redact_urls:
         text = URL_RE.sub("[LINK]", text)
 
-    # Basic whitespace normalization
     text = " ".join(text.split()).strip()
     if not text:
         return None
+
+    words = len(text.split())
 
     return {
         "sender": msg.get("sender_name", ""),
         "ts_ms": int(msg.get("timestamp_ms", 0)),
         "text": text,
+        "word_count": words,
     }
+
 
 def merge_consecutive_by_sender(
     events: List[Dict[str, Any]],
     merge_window_seconds: int = 3600,
     join_with: str = "\n",
 ) -> List[Dict[str, Any]]:
-    """
-    Merge consecutive events from the same sender if time gap <= merge_window_seconds.
-    """
     if not events:
         return []
 
@@ -73,11 +76,12 @@ def merge_consecutive_by_sender(
     cur = dict(events[0])
     for nxt in events[1:]:
         same_sender = (nxt["sender"] == cur["sender"])
-        gap = nxt["ts_ms"] - cur["ts_ms"]  # events are sorted; gap >= 0
+        gap = nxt["ts_ms"] - cur["ts_ms"]
 
         if same_sender and gap <= window_ms:
             cur["text"] = cur["text"] + join_with + nxt["text"]
             cur["ts_ms"] = nxt["ts_ms"]
+            cur["word_count"] += nxt.get("word_count", 0)
         else:
             merged.append(cur)
             cur = dict(nxt)
@@ -85,14 +89,11 @@ def merge_consecutive_by_sender(
     merged.append(cur)
     return merged
 
+
 def split_into_sessions(
     events: List[Dict[str, Any]],
     session_gap_seconds: int = 6 * 3600,
 ) -> List[List[Dict[str, Any]]]:
-    """
-    Break the timeline into sessions when adjacent gap exceeds session_gap_seconds.
-    This is independent from the merge window.
-    """
     if not events:
         return []
 
@@ -110,8 +111,10 @@ def split_into_sessions(
     sessions.append(cur)
     return sessions
 
+
 def role_for_sender(sender: str, my_name: str) -> str:
     return "assistant" if sender == my_name else "user"
+
 
 def build_chat_examples_from_session(
     session: List[Dict[str, Any]],
@@ -120,36 +123,18 @@ def build_chat_examples_from_session(
     include_system: bool = True,
     system_text: str = "You are Soham. Speak exactly like Soham.",
 ) -> List[Dict[str, Any]]:
-    """
-    Convert a session into one or more training examples.
-
-    Strategy:
-    - Create rolling windows of up to max_messages_per_example messages.
-    - Each example starts at a boundary that keeps roles alternating as in chat.
-    - This yields multiple training examples per session and helps training.
-    """
     if not session:
         return []
 
-    # Convert events to role messages
     msgs = [{"role": role_for_sender(e["sender"], my_name), "content": e["text"]} for e in session]
 
-    # Optional: drop leading message from me
-    # while msgs and msgs[0]["role"] == "assistant":
-    #     msgs = msgs[1:]
-
-    # If first message is from me, prepend a dummy user prompt.
     if msgs and msgs[0]["role"] == "assistant":
-        # Preserve assistant-initiated conversations by creating a dummy prompt.
         msgs = [{"role": "user", "content": "<CONVERSATION_START>"}] + msgs
 
     if not msgs:
         return []
 
     examples: List[Dict[str, Any]] = []
-
-    # Create windows; overlapping windows are okay and often beneficial.
-    # Step size can be tuned; start with half window overlap.
     step = max(1, max_messages_per_example // 2)
 
     for start in range(0, len(msgs), step):
@@ -157,7 +142,6 @@ def build_chat_examples_from_session(
         if len(chunk) < 2:
             continue
 
-        # Require at least one assistant turn in the chunk
         if not any(m["role"] == "assistant" for m in chunk):
             continue
 
@@ -173,13 +157,14 @@ def build_chat_examples_from_session(
 
     return examples
 
+
 def convert_one_thread_to_jsonl(
     input_json_path: str,
     output_jsonl_path: str,
     my_name: str,
     skip_if_has_keys: Optional[List[str]] = None,
-    merge_window_seconds: int = 3600,        # 1 hour, as requested
-    session_gap_seconds: int = 6 * 3600,     # optional; adjust or set very large to effectively disable
+    merge_window_seconds: int = 3600,
+    session_gap_seconds: int = 6 * 3600,
     max_messages_per_example: int = 24,
     redact_urls: bool = True,
 ) -> Dict[str, int]:
@@ -187,29 +172,23 @@ def convert_one_thread_to_jsonl(
 
     thread = json.loads(Path(input_json_path).read_text(encoding="utf-8"))
     raw = thread.get("messages", [])
-
-    # Sort oldest -> newest (Messenger exports are often newest-first)
     raw = sorted(raw, key=lambda m: int(m.get("timestamp_ms", 0)))
 
-    # Normalize + filter
-    events = []
+    events: List[Dict[str, Any]] = []
     for m in raw:
         e = normalize_message(m, skip_if_has_keys=skip_if_has_keys, redact_urls=redact_urls)
         if e is not None:
             events.append(e)
 
-    # Merge consecutive messages from same sender within 1 hour
     events_merged = merge_consecutive_by_sender(
         events,
         merge_window_seconds=merge_window_seconds,
         join_with="<MSG_BREAK>",
     )
 
-    # Split into sessions to avoid huge examples
     sessions = split_into_sessions(events_merged, session_gap_seconds=session_gap_seconds)
 
-    # Build training examples
-    examples = []
+    examples: List[Dict[str, Any]] = []
     for sess in sessions:
         examples.extend(
             build_chat_examples_from_session(
@@ -224,6 +203,8 @@ def convert_one_thread_to_jsonl(
     out_path = Path(output_jsonl_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    total_words = sum(e.get("word_count", 0) for e in events_merged)
+
     with out_path.open("w", encoding="utf-8") as f:
         for ex in examples:
             f.write(json.dumps(ex, ensure_ascii=False) + "\n")
@@ -234,7 +215,9 @@ def convert_one_thread_to_jsonl(
         "merged_events": len(events_merged),
         "sessions": len(sessions),
         "examples_written": len(examples),
+        "total_words": total_words,
     }
+
 
 def convert_directory(
     input_dir: str,
@@ -249,11 +232,11 @@ def convert_directory(
     overwrite: bool = False,
 ) -> Dict[str, Any]:
     """
-    For every file named message_???.json in input_dir, produce thread_???.jsonl in output_dir.
+    For every file named message_<thread>_<idx>.json in input_dir, produce
+    thread_<thread>_<idx>.jsonl in output_dir.
 
-    - If recursive=True, searches subdirectories.
-    - If overwrite=False, skips outputs that already exist.
-    - Returns summary stats.
+    This matches the new flattened/copy output structure like:
+      message_jennyliang_10208450689498493_3.json
     """
     in_dir = Path(input_dir)
     out_dir = Path(output_dir)
@@ -262,7 +245,6 @@ def convert_directory(
     if not in_dir.exists() or not in_dir.is_dir():
         raise ValueError(f"Input dir does not exist or is not a directory: {in_dir}")
 
-    # Choose globbing strategy
     paths = list(in_dir.rglob("message_*.json") if recursive else in_dir.glob("message_*.json"))
     paths = sorted(paths)
 
@@ -277,19 +259,21 @@ def convert_directory(
         "merged_events": 0,
         "sessions": 0,
         "examples_written": 0,
+        "total_words": 0,
     }
 
     per_file: List[Dict[str, Any]] = []
 
     for p in paths:
-        m = MESSAGE_FILE_RE.match(p.name)
+        m = NEW_MESSAGE_FILE_RE.match(p.name)
         if not m:
-            # Matches message_*.json but not strictly numeric; skip to be safe
             skipped_files += 1
             continue
 
-        idx = m.group(1)  # numeric suffix
-        out_path = out_dir / f"thread_{idx}.jsonl"
+        thread_id = m.group(1)  # everything between first "message_" and last "_<digits>.json"
+        idx = m.group(2)
+
+        out_path = out_dir / f"thread_{thread_id}_{idx}.jsonl"
 
         if out_path.exists() and not overwrite:
             skipped_files += 1
@@ -309,7 +293,6 @@ def convert_directory(
             )
             converted_files += 1
 
-            # accumulate totals
             for k in totals:
                 totals[k] += int(stats.get(k, 0))
 
@@ -336,27 +319,11 @@ def convert_directory(
         "files_skipped": skipped_files,
         "files_errors": error_files,
         "totals": totals,
-        "per_file": per_file,  # you can remove this if it’s too verbose
+        "per_file": per_file,
     }
 
 
-### Single example
-
-# stats = convert_one_thread_to_jsonl(
-#     input_json_path="data/raw/message_1.json",
-#     output_jsonl_path="data/cleaned/thread_1.jsonl",
-#     my_name="Soham Pardeshi",
-#     skip_if_has_keys=["call_duration"],   # you can add more keys here
-#     merge_window_seconds=3 * 60 * 60,     # merged 3 hours
-#     session_gap_seconds=48 * 60 * 60,     # messages that are 2 days older are separate
-#     max_messages_per_example=48,
-#     redact_urls=True,
-# )
-# print(stats)
-
-
-### Directory of examples
-
+# Directory run example
 summary = convert_directory(
     input_dir="data/raw",
     output_dir="data/cleaned",
@@ -367,7 +334,7 @@ summary = convert_directory(
     max_messages_per_example=48,
     redact_urls=True,
     recursive=True,
-    overwrite=True,   # set False if you want to skip already-existing outputs
+    overwrite=True,
 )
 print("SUMMARY:", summary["totals"])
 print("FILES:", {
